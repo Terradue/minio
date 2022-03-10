@@ -101,7 +101,7 @@ pools: 1
 
 # Deploy if 'mode == gateway' - 4 replicas.
 gateway:
-  type: "nas" # currently only "nas,gcs" are supported.
+  type: "nas" # currently only "nas,gcs,s3" are supported.
   replicas: 4
   gcs:
     serviceAccountFile: "" # credential JSON file of service account key (not required if using existing secret)
