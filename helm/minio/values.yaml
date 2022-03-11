@@ -354,3 +354,6 @@ etcd:
   corednsPathPrefix: ""
   clientCert: ""
   clientCertKey: ""
+  existingSecret: ""
+  clientCertSecretFilename: ""
+  clientCertKeySecretFilename: ""

@@ -80,6 +80,11 @@ spec:
             - name: minio-user
               mountPath: "/tmp/credentials"
               readOnly: true
+            {{- if .Values.etcd.existingSecret }}
+            - name: etcd-client-secret
+              mountPath: "/tmp/etcd-client-secret"
+              readOnly: true
+            {{- end }}
             {{- if .Values.persistence.enabled }}
             - name: export
               mountPath: {{ .Values.mountPath }}
@@ -115,6 +120,12 @@ spec:
             {{- if .Values.etcd.endpoints }}
             - name: MINIO_ETCD_ENDPOINTS
               value: {{ join "," .Values.etcd.endpoints | quote }}
+            {{- if .Values.etcd.existingSecret }}
+            - name: MINIO_ETCD_CLIENT_CERT
+              value: /tmp/etcd-client-secret/{{ .Values.etcd.clientCertSecretFilename }}
+            - name: MINIO_ETCD_CLIENT_CERT_KEY
+              value: /tmp/etcd-client-secret/{{ .Values.etcd.clientCertKeySecretFilename }}
+            {{- else }}
             {{- if .Values.etcd.clientCert }}
             - name: MINIO_ETCD_CLIENT_CERT
               value: "/tmp/credentials/etcd_client.crt"
@@ -122,6 +133,7 @@ spec:
             {{- if .Values.etcd.clientCertKey }}
             - name: MINIO_ETCD_CLIENT_CERT_KEY
               value: "/tmp/credentials/etcd_client.key"
+            {{- end }}
             {{- end }}
             {{- if .Values.etcd.pathPrefix }}
             - name: MINIO_ETCD_PATH_PREFIX
@@ -158,6 +170,11 @@ spec:
             claimName: {{ .Values.persistence.existingClaim | default (include "minio.fullname" .) }}
         {{- else }}
           emptyDir: {}
+        {{- end }}
+        {{- if .Values.etcd.existingSecret }}
+        - name: etcd-client-secret
+          secret:
+            secretName: {{ .Values.etcd.existingSecret }}
         {{- end }}
         - name: minio-user
           secret:
