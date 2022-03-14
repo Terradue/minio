@@ -48,6 +48,7 @@ func init() {
 		getMinioHealingMetrics(),
 		getNodeHealthMetrics(),
 		getClusterStorageMetrics(),
+		getClusterTierMetrics(),
 	}
 
 	peerMetricsGroups = []*MetricsGroup{
@@ -137,6 +138,7 @@ const (
 	limitTotal     MetricName = "limit_total"
 	missedTotal    MetricName = "missed_total"
 	waitingTotal   MetricName = "waiting_total"
+	incomingTotal  MetricName = "incoming_total"
 	objectTotal    MetricName = "object_total"
 	offlineTotal   MetricName = "offline_total"
 	onlineTotal    MetricName = "online_total"
@@ -180,6 +182,10 @@ const (
 	expiryPendingTasks     MetricName = "expiry_pending_tasks"
 	transitionPendingTasks MetricName = "transition_pending_tasks"
 	transitionActiveTasks  MetricName = "transition_active_tasks"
+
+	transitionedBytes    MetricName = "transitioned_bytes"
+	transitionedObjects  MetricName = "transitioned_objects"
+	transitionedVersions MetricName = "transitioned_versions"
 )
 
 const (
@@ -566,6 +572,16 @@ func getS3RequestsInQueueMD() MetricDescription {
 		Subsystem: requestsSubsystem,
 		Name:      waitingTotal,
 		Help:      "Number of S3 requests in the waiting queue",
+		Type:      gaugeMetric,
+	}
+}
+
+func getIncomingS3RequestsMD() MetricDescription {
+	return MetricDescription{
+		Namespace: s3MetricNamespace,
+		Subsystem: requestsSubsystem,
+		Name:      incomingTotal,
+		Help:      "Volatile number of total incoming S3 requests",
 		Type:      gaugeMetric,
 	}
 }
@@ -1435,6 +1451,11 @@ func getHTTPMetrics() *MetricsGroup {
 			Description: getS3RequestsInQueueMD(),
 			Value:       float64(httpStats.S3RequestsInQueue),
 		})
+		metrics = append(metrics, Metric{
+			Description: getIncomingS3RequestsMD(),
+			Value:       float64(httpStats.S3RequestsIncoming),
+		})
+
 		for api, value := range httpStats.CurrentS3Requests.APIStats {
 			metrics = append(metrics, Metric{
 				Description:    getS3RequestsInFlightMD(),
@@ -1589,9 +1610,65 @@ func getBucketUsageMetrics() *MetricsGroup {
 				HistogramBucketLabel: "range",
 				VariableLabels:       map[string]string{"bucket": bucket},
 			})
-
 		}
 		return
+	})
+	return mg
+}
+
+func getClusterTransitionedBytesMD() MetricDescription {
+	return MetricDescription{
+		Namespace: clusterMetricNamespace,
+		Subsystem: ilmSubsystem,
+		Name:      transitionedBytes,
+		Help:      "Total bytes transitioned to a tier",
+		Type:      gaugeMetric,
+	}
+}
+
+func getClusterTransitionedObjectsMD() MetricDescription {
+	return MetricDescription{
+		Namespace: clusterMetricNamespace,
+		Subsystem: ilmSubsystem,
+		Name:      transitionedObjects,
+		Help:      "Total number of objects transitioned to a tier",
+		Type:      gaugeMetric,
+	}
+}
+
+func getClusterTransitionedVersionsMD() MetricDescription {
+	return MetricDescription{
+		Namespace: clusterMetricNamespace,
+		Subsystem: ilmSubsystem,
+		Name:      transitionedVersions,
+		Help:      "Total number of versions transitioned to a tier",
+		Type:      gaugeMetric,
+	}
+}
+
+func getClusterTierMetrics() *MetricsGroup {
+	mg := &MetricsGroup{
+		cacheInterval: 10 * time.Second,
+	}
+	mg.RegisterRead(func(ctx context.Context) (metrics []Metric) {
+		if globalTierConfigMgr.Empty() {
+			return
+		}
+		objLayer := newObjectLayerFn()
+		if objLayer == nil || globalIsGateway {
+			return
+		}
+
+		dui, err := loadDataUsageFromBackend(GlobalContext, objLayer)
+		if err != nil {
+			return
+		}
+		// data usage has not captured any tier stats yet.
+		if dui.TierStats == nil {
+			return
+		}
+
+		return dui.tierMetrics()
 	})
 	return mg
 }

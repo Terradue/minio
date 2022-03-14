@@ -23,6 +23,7 @@ import (
 	"crypto/subtle"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"io"
@@ -284,6 +285,7 @@ type ServerHTTPAPIStats struct {
 // including their average execution time.
 type ServerHTTPStats struct {
 	S3RequestsInQueue      int32              `json:"s3RequestsInQueue"`
+	S3RequestsIncoming     uint64             `json:"s3RequestsIncoming"`
 	CurrentS3Requests      ServerHTTPAPIStats `json:"currentS3Requests"`
 	TotalS3Requests        ServerHTTPAPIStats `json:"totalS3Requests"`
 	TotalS3Errors          ServerHTTPAPIStats `json:"totalS3Errors"`
@@ -934,6 +936,50 @@ func (a adminAPIHandlers) BackgroundHealStatusHandler(w http.ResponseWriter, r *
 	}
 }
 
+// NetperfHandler - perform mesh style network throughput test
+func (a adminAPIHandlers) NetperfHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := newContext(r, w, "NetperfHandler")
+
+	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
+
+	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.HealthInfoAdminAction)
+	if objectAPI == nil {
+		return
+	}
+
+	if !globalIsDistErasure {
+		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrNotImplemented), r.URL)
+		return
+	}
+
+	nsLock := objectAPI.NewNSLock(minioMetaBucket, "netperf")
+	lkctx, err := nsLock.GetLock(ctx, globalOperationTimeout)
+	if err != nil {
+		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(toAPIErrorCode(ctx, err)), r.URL)
+		return
+	}
+	defer nsLock.Unlock(lkctx.Cancel)
+
+	durationStr := r.Form.Get(peerRESTDuration)
+	duration, err := time.ParseDuration(durationStr)
+	if err != nil {
+		duration = globalNetPerfMinDuration
+	}
+
+	if duration < globalNetPerfMinDuration {
+		// We need sample size of minimum 10 secs.
+		duration = globalNetPerfMinDuration
+	}
+
+	duration = duration.Round(time.Second)
+
+	results := globalNotificationSys.Netperf(ctx, duration)
+	enc := json.NewEncoder(w)
+	if err := enc.Encode(madmin.NetperfResult{NodeResults: results}); err != nil {
+		return
+	}
+}
+
 // SpeedtestHandler - Deprecated. See ObjectSpeedtestHandler
 func (a adminAPIHandlers) SpeedtestHandler(w http.ResponseWriter, r *http.Request) {
 	a.ObjectSpeedtestHandler(w, r)
@@ -981,6 +1027,31 @@ func (a adminAPIHandlers) ObjectSpeedtestHandler(w http.ResponseWriter, r *http.
 	duration, err := time.ParseDuration(durationStr)
 	if err != nil {
 		duration = time.Second * 10
+	}
+
+	// ignores any errors here.
+	storageInfo, _ := objectAPI.StorageInfo(ctx)
+	capacityNeeded := uint64(concurrent * size)
+	capacity := uint64(GetTotalUsableCapacityFree(storageInfo.Disks, storageInfo))
+
+	if capacity < capacityNeeded {
+		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, AdminError{
+			Code: "XMinioSpeedtestInsufficientCapacity",
+			Message: fmt.Sprintf("not enough usable space available to perform speedtest - expected %s, got %s",
+				humanize.IBytes(capacityNeeded), humanize.IBytes(capacity)),
+			StatusCode: http.StatusInsufficientStorage,
+		}), r.URL)
+		return
+	}
+
+	// Verify if we can employ autotune without running out of capacity,
+	// if we do run out of capacity, make sure to turn-off autotuning
+	// in such situations.
+	newConcurrent := concurrent + (concurrent+1)/2
+	autoTunedCapacityNeeded := uint64(newConcurrent * size)
+	if autotune && capacity < autoTunedCapacityNeeded {
+		// Turn-off auto-tuning if next possible concurrency would reach beyond disk capacity.
+		autotune = false
 	}
 
 	deleteBucket := func() {
@@ -2221,7 +2292,7 @@ func fetchKMSStatus() madmin.KMS {
 func fetchLoggerInfo() ([]madmin.Logger, []madmin.Audit) {
 	var loggerInfo []madmin.Logger
 	var auditloggerInfo []madmin.Audit
-	for _, target := range logger.Targets() {
+	for _, target := range logger.SystemTargets() {
 		if target.Endpoint() != "" {
 			tgt := target.String()
 			err := checkConnection(target.Endpoint(), 15*time.Second)
@@ -2401,7 +2472,9 @@ func (a adminAPIHandlers) InspectDataHandler(w http.ResponseWriter, r *http.Requ
 		}
 		return nil
 	})
-	logger.LogIf(ctx, err)
+	if !errors.Is(err, errFileNotFound) {
+		logger.LogIf(ctx, err)
+	}
 }
 
 func createHostAnonymizerForFSMode() map[string]string {

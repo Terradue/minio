@@ -97,21 +97,6 @@ type erasureSets struct {
 	lastConnectDisksOpTime time.Time
 }
 
-// Return false if endpoint is not connected or has been reconnected after last check
-func isEndpointConnectionStable(diskMap map[Endpoint]StorageAPI, endpoint Endpoint, lastCheck time.Time) bool {
-	disk := diskMap[endpoint]
-	if disk == nil {
-		return false
-	}
-	if !disk.IsOnline() {
-		return false
-	}
-	if !lastCheck.IsZero() && disk.LastConn().After(lastCheck) {
-		return false
-	}
-	return true
-}
-
 func (s *erasureSets) getDiskMap() map[Endpoint]StorageAPI {
 	diskMap := make(map[Endpoint]StorageAPI)
 
@@ -209,12 +194,26 @@ func (s *erasureSets) connectDisks() {
 	}()
 
 	var wg sync.WaitGroup
-	setsJustConnected := make([]bool, s.setCount)
 	diskMap := s.getDiskMap()
+	setsJustConnected := make([]bool, s.setCount)
 	for _, endpoint := range s.endpoints.Endpoints {
-		if isEndpointConnectionStable(diskMap, endpoint, s.lastConnectDisksOpTime) {
-			continue
+		cdisk := diskMap[endpoint]
+		if cdisk != nil && cdisk.IsOnline() {
+			if s.lastConnectDisksOpTime.IsZero() {
+				continue
+			}
+
+			// An online-disk means its a valid disk but it may be a re-connected disk
+			// we verify that here based on LastConn(), however we make sure to avoid
+			// putting it back into the s.erasureDisks by re-placing the disk again.
+			_, setIndex, _ := cdisk.GetDiskLoc()
+			if setIndex != -1 {
+				// Recently disconnected disks must go to MRF
+				setsJustConnected[setIndex] = cdisk.LastConn().After(s.lastConnectDisksOpTime)
+				continue
+			}
 		}
+
 		wg.Add(1)
 		go func(endpoint Endpoint) {
 			defer wg.Done()
@@ -222,7 +221,6 @@ func (s *erasureSets) connectDisks() {
 			if err != nil {
 				if endpoint.IsLocal && errors.Is(err, errUnformattedDisk) {
 					globalBackgroundHealState.pushHealLocalDisks(endpoint)
-					logger.Info(fmt.Sprintf("Found unformatted drive %s, attempting to heal...", endpoint))
 				} else {
 					printEndpointError(endpoint, err, true)
 				}
@@ -230,7 +228,6 @@ func (s *erasureSets) connectDisks() {
 			}
 			if disk.IsLocal() && disk.Healing() != nil {
 				globalBackgroundHealState.pushHealLocalDisks(disk.Endpoint())
-				logger.Info(fmt.Sprintf("Found the drive %s that needs healing, attempting to heal...", disk))
 			}
 			s.erasureDisksMu.RLock()
 			setIndex, diskIndex, err := findDiskIndex(s.format, format)
@@ -268,7 +265,7 @@ func (s *erasureSets) connectDisks() {
 				s.erasureDisks[setIndex][diskIndex] = disk
 			}
 			disk.SetDiskLoc(s.poolIndex, setIndex, diskIndex)
-			setsJustConnected[setIndex] = true
+			setsJustConnected[setIndex] = true // disk just went online we treat it is as MRF event
 			s.erasureDisksMu.Unlock()
 		}(endpoint)
 	}
@@ -280,7 +277,7 @@ func (s *erasureSets) connectDisks() {
 			if !justConnected {
 				continue
 			}
-			globalMRFState.newSetReconnected(setIndex, s.poolIndex)
+			globalMRFState.newSetReconnected(s.poolIndex, setIndex)
 		}
 	}()
 }
@@ -508,9 +505,18 @@ func (s *erasureSets) cleanupDeletedObjects(ctx context.Context) {
 			// Reset for the next interval
 			timer.Reset(globalAPIConfig.getDeleteCleanupInterval())
 
+			var wg sync.WaitGroup
 			for _, set := range s.sets {
-				set.cleanupDeletedObjects(ctx)
+				wg.Add(1)
+				go func(set *erasureObjects) {
+					defer wg.Done()
+					if set == nil {
+						return
+					}
+					set.cleanupDeletedObjects(ctx)
+				}(set)
 			}
+			wg.Wait()
 		}
 	}
 }
@@ -527,9 +533,18 @@ func (s *erasureSets) cleanupStaleUploads(ctx context.Context) {
 			// Reset for the next interval
 			timer.Reset(globalAPIConfig.getStaleUploadsCleanupInterval())
 
+			var wg sync.WaitGroup
 			for _, set := range s.sets {
-				set.cleanupStaleUploads(ctx, globalAPIConfig.getStaleUploadsExpiry())
+				wg.Add(1)
+				go func(set *erasureObjects) {
+					defer wg.Done()
+					if set == nil {
+						return
+					}
+					set.cleanupStaleUploads(ctx, globalAPIConfig.getStaleUploadsExpiry())
+				}(set)
 			}
+			wg.Wait()
 		}
 	}
 }
@@ -1208,21 +1223,6 @@ func formatsToDrivesInfo(endpoints Endpoints, formats []*formatErasureV3, sErrs 
 	return beforeDrives
 }
 
-// If it is a single node Erasure and all disks are root disks, it is most likely a test setup, else it is a production setup.
-// On a test setup we allow creation of format.json on root disks to help with dev/testing.
-func isTestSetup(infos []DiskInfo, errs []error) bool {
-	rootDiskCount := 0
-	for i := range errs {
-		if errs[i] == nil || errs[i] == errUnformattedDisk {
-			if infos[i].RootDisk {
-				rootDiskCount++
-			}
-		}
-	}
-	// It is a test setup if all disks are root disks in quorum.
-	return rootDiskCount >= len(infos)/2+1
-}
-
 func getHealDiskInfos(storageDisks []StorageAPI, errs []error) ([]DiskInfo, []error) {
 	infos := make([]DiskInfo, len(storageDisks))
 	g := errgroup.WithNErrs(len(storageDisks))
@@ -1245,18 +1245,17 @@ func getHealDiskInfos(storageDisks []StorageAPI, errs []error) ([]DiskInfo, []er
 
 // Mark root disks as down so as not to heal them.
 func markRootDisksAsDown(storageDisks []StorageAPI, errs []error) {
-	var infos []DiskInfo
-	infos, errs = getHealDiskInfos(storageDisks, errs)
-	if !isTestSetup(infos, errs) {
-		for i := range storageDisks {
-			if storageDisks[i] != nil && infos[i].RootDisk {
-				// We should not heal on root disk. i.e in a situation where the minio-administrator has unmounted a
-				// defective drive we should not heal a path on the root disk.
-				logger.Info("Disk `%s` the same as the system root disk.\n"+
-					"Disk will not be used. Please supply a separate disk and restart the server.",
-					storageDisks[i].String())
-				storageDisks[i] = nil
-			}
+	if globalIsCICD {
+		// Do nothing
+		return
+	}
+	infos, _ := getHealDiskInfos(storageDisks, errs)
+	for i := range storageDisks {
+		if storageDisks[i] != nil && infos[i].RootDisk {
+			// We should not heal on root disk. i.e in a situation where the minio-administrator has unmounted a
+			// defective drive we should not heal a path on the root disk.
+			logger.LogIf(GlobalContext, fmt.Errorf("Disk `%s` is part of root disk, will not be used", storageDisks[i]))
+			storageDisks[i] = nil
 		}
 	}
 }

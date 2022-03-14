@@ -335,7 +335,9 @@ func (z *erasureServerPools) getPoolIdxExistingWithOpts(ctx context.Context, buc
 			pinfo := poolObjInfo{
 				PoolIndex: i,
 			}
-			opts.VersionID = "" // no need to check for specific versionId
+			// do not remove this check as it can lead to inconsistencies
+			// for all callers of bucket replication.
+			opts.VersionID = ""
 			pinfo.ObjInfo, pinfo.Err = pool.GetObjectInfo(ctx, bucket, object, opts)
 			poolObjInfos[i] = pinfo
 		}(i, pool, poolOpts[i])
@@ -353,13 +355,13 @@ func (z *erasureServerPools) getPoolIdxExistingWithOpts(ctx context.Context, buc
 	})
 
 	for _, pinfo := range poolObjInfos {
-		if pinfo.Err != nil && !isErrObjectNotFound(pinfo.Err) {
-			return -1, pinfo.Err
-		}
-
 		// skip all objects from suspended pools for mutating calls.
 		if z.IsSuspended(pinfo.PoolIndex) && opts.Mutate {
 			continue
+		}
+
+		if pinfo.Err != nil && !isErrObjectNotFound(pinfo.Err) {
+			return -1, pinfo.Err
 		}
 
 		if isErrObjectNotFound(pinfo.Err) {
@@ -659,6 +661,9 @@ func (z *erasureServerPools) MakeBucketWithLocation(ctx context.Context, bucket 
 	for index := range z.serverPools {
 		index := index
 		g.Go(func() error {
+			if z.IsSuspended(index) {
+				return nil
+			}
 			return z.serverPools[index].MakeBucketWithLocation(ctx, bucket, opts)
 		}, index)
 	}
@@ -669,7 +674,10 @@ func (z *erasureServerPools) MakeBucketWithLocation(ctx context.Context, bucket 
 		if err != nil {
 			if _, ok := err.(BucketExists); !ok {
 				// Delete created buckets, ignoring errors.
-				z.DeleteBucket(context.Background(), bucket, DeleteBucketOptions{Force: true, NoRecreate: true})
+				z.DeleteBucket(context.Background(), bucket, DeleteBucketOptions{
+					Force:      false,
+					NoRecreate: true,
+				})
 			}
 			return err
 		}
@@ -1474,6 +1482,9 @@ func (z *erasureServerPools) DeleteBucket(ctx context.Context, bucket string, op
 	for index := range z.serverPools {
 		index := index
 		g.Go(func() error {
+			if z.IsSuspended(index) {
+				return nil
+			}
 			return z.serverPools[index].DeleteBucket(ctx, bucket, opts)
 		}, index)
 	}
@@ -1666,7 +1677,13 @@ func (z *erasureServerPools) Walk(ctx context.Context, bucket, prefix string, re
 							cancel()
 							return
 						}
-
+						if opts.WalkAscending {
+							for i := len(fivs.Versions) - 1; i >= 0; i-- {
+								version := fivs.Versions[i]
+								results <- version.ToObjectInfo(bucket, version.Name)
+							}
+							return
+						}
 						for _, version := range fivs.Versions {
 							results <- version.ToObjectInfo(bucket, version.Name)
 						}
@@ -1722,14 +1739,13 @@ func (z *erasureServerPools) Walk(ctx context.Context, bucket, prefix string, re
 // HealObjectFn closure function heals the object.
 type HealObjectFn func(bucket, object, versionID string) error
 
-func listAndHeal(ctx context.Context, bucket, prefix string, set *erasureObjects, healEntry func(metaCacheEntry) error, errCh chan<- error) {
+func listAndHeal(ctx context.Context, bucket, prefix string, set *erasureObjects, healEntry func(metaCacheEntry) error) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	disks, _ := set.getOnlineDisksWithHealing()
 	if len(disks) == 0 {
-		errCh <- errors.New("listAndHeal: No non-healing disks found")
-		return
+		return errors.New("listAndHeal: No non-healing disks found")
 	}
 
 	// How to resolve partial results.
@@ -1755,8 +1771,8 @@ func listAndHeal(ctx context.Context, bucket, prefix string, set *erasureObjects
 		reportNotFound: false,
 		agreed: func(entry metaCacheEntry) {
 			if err := healEntry(entry); err != nil {
-				errCh <- err
-				return
+				logger.LogIf(ctx, err)
+				cancel()
 			}
 		},
 		partial: func(entries metaCacheEntries, nAgreed int, errs []error) {
@@ -1768,7 +1784,8 @@ func listAndHeal(ctx context.Context, bucket, prefix string, set *erasureObjects
 			}
 
 			if err := healEntry(*entry); err != nil {
-				errCh <- err
+				logger.LogIf(ctx, err)
+				cancel()
 				return
 			}
 		},
@@ -1776,13 +1793,13 @@ func listAndHeal(ctx context.Context, bucket, prefix string, set *erasureObjects
 	}
 
 	if err := listPathRaw(ctx, lopts); err != nil {
-		errCh <- fmt.Errorf("listPathRaw returned %w: opts(%#v)", err, lopts)
-		return
+		return fmt.Errorf("listPathRaw returned %w: opts(%#v)", err, lopts)
 	}
+
+	return nil
 }
 
 func (z *erasureServerPools) HealObjects(ctx context.Context, bucket, prefix string, opts madmin.HealOpts, healObjectFn HealObjectFn) error {
-	errCh := make(chan error)
 	healEntry := func(entry metaCacheEntry) error {
 		if entry.isDir() {
 			return nil
@@ -1821,26 +1838,33 @@ func (z *erasureServerPools) HealObjects(ctx context.Context, bucket, prefix str
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	go func() {
-		defer close(errCh)
-
+	var poolErrs [][]error
+	for idx, erasureSet := range z.serverPools {
+		if z.IsSuspended(idx) {
+			continue
+		}
+		errs := make([]error, len(erasureSet.sets))
 		var wg sync.WaitGroup
-		for idx, erasureSet := range z.serverPools {
-			if z.IsSuspended(idx) {
-				continue
-			}
-			for _, set := range erasureSet.sets {
-				wg.Add(1)
-				go func(set *erasureObjects) {
-					defer wg.Done()
+		for idx, set := range erasureSet.sets {
+			wg.Add(1)
+			go func(idx int, set *erasureObjects) {
+				defer wg.Done()
 
-					listAndHeal(ctx, bucket, prefix, set, healEntry, errCh)
-				}(set)
-			}
+				errs[idx] = listAndHeal(ctx, bucket, prefix, set, healEntry)
+			}(idx, set)
 		}
 		wg.Wait()
-	}()
-	return <-errCh
+		poolErrs = append(poolErrs, errs)
+	}
+	for _, errs := range poolErrs {
+		for _, err := range errs {
+			if err == nil {
+				continue
+			}
+			return err
+		}
+	}
+	return nil
 }
 
 func (z *erasureServerPools) HealObject(ctx context.Context, bucket, object, versionID string, opts madmin.HealOpts) (madmin.HealResultItem, error) {
