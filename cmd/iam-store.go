@@ -995,7 +995,9 @@ func (store *IAMStoreSys) GetPolicy(name string) (iampolicy.Policy, error) {
 		}
 		v, ok := cache.iamPolicyDocsMap[policy]
 		if !ok {
-			return v.Policy, errNoSuchPolicy
+			// Ignore missing policies[emathot 25/04/2024]
+			continue
+			// return v.Policy, errNoSuchPolicy
 		}
 		combinedPolicy = combinedPolicy.Merge(v.Policy)
 	}
